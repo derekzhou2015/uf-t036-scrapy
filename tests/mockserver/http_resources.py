@@ -17,6 +17,7 @@ from tests import get_testdata
 if TYPE_CHECKING:
     from collections.abc import Callable, Sequence
 
+    from twisted.internet.base import DelayedCall
     from twisted.internet.defer import Deferred
     from twisted.python.failure import Failure
     from twisted.web._http2 import H2Connection, H2Stream
@@ -78,6 +79,49 @@ class ForeverTakingResource(BaseResource):
     def render(self, request: Request) -> int:
         if self._write:
             request.write(b"some bytes")
+        return server.NOT_DONE_YET
+
+
+class SlowDripResource(BaseResource):
+    """A resource that sends the response headers right away and then writes
+    the body one byte at a time, so that no single read stalls for long but
+    the full response takes much longer than a short download timeout.
+    """
+
+    def __init__(self, interval: float = 0.1, count: int = 50):
+        super().__init__()
+        self._interval = interval
+        self._count = count
+
+    def render(self, request: Request) -> int:
+        from twisted.internet import reactor
+
+        request.setHeader(b"Content-Length", str(self._count).encode())
+        remaining = self._count
+        delayed: DelayedCall | None = None
+        disconnected = False
+
+        def drip() -> None:
+            nonlocal remaining, delayed
+            if disconnected:
+                return
+            if remaining <= 0:
+                request.finish()
+                return
+            request.write(b"x")
+            remaining -= 1
+            delayed = reactor.callLater(self._interval, drip)
+
+        def stop_dripping(_: Any) -> None:
+            nonlocal disconnected
+            disconnected = True
+            if delayed is not None and delayed.active():
+                delayed.cancel()
+
+        # fires on both finish() and the client going away, e.g. on a
+        # download timeout
+        request.notifyFinish().addBoth(stop_dripping)
+        drip()
         return server.NOT_DONE_YET
 
 

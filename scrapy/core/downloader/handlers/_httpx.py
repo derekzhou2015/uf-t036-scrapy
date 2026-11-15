@@ -178,7 +178,7 @@ class HttpxDownloadHandler(_Base):
     async def _make_request(
         self,
         request: Request,
-        timeout: float,  # noqa: ASYNC109
+        timeout: float | None,  # noqa: ASYNC109
     ) -> AsyncIterator[httpx.Response]:
         proxy = self._extract_proxy_url_with_creds(request)
         if proxy and proxy.startswith("socks") and not HAS_SOCKS:  # pragma: no cover
@@ -258,7 +258,9 @@ class HttpxDownloadHandler(_Base):
 
     @staticmethod
     def _is_timeout_exception(exc: Exception) -> bool:
-        return isinstance(exc, httpx.ReadTimeout)
+        # TimeoutError is raised by BaseStreamingDownloadHandler when the
+        # overall download deadline is hit while reading the response body.
+        return isinstance(exc, (httpx.ReadTimeout, TimeoutError))
 
     def _log_tls_info(self, response: httpx.Response, request: Request) -> None:
         network_stream: AsyncNetworkStream = response.extensions["network_stream"]

@@ -135,7 +135,7 @@ class AiohttpDownloadHandler(BaseStreamingDownloadHandler[_ClientResponse]):
     async def _make_request(
         self,
         request: Request,
-        timeout: float,  # noqa: ASYNC109
+        timeout: float | None,  # noqa: ASYNC109
     ) -> AsyncIterator[_ClientResponse]:
         proxy = self._extract_proxy_url_with_creds(request)
         proxy_headers = get_proxy_headers(request)

@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import asyncio
 import base64
 import logging
 import time
 from abc import abstractmethod
+from contextlib import AsyncExitStack, nullcontext
 from io import BytesIO
 from pathlib import Path
 from typing import (
@@ -24,6 +26,7 @@ from w3lib.url import add_http_if_no_scheme
 from scrapy import Request, signals
 from scrapy.exceptions import (
     DownloadCancelledError,
+    DownloadTimeoutError,
     NotConfigured,
     ResponseDataLossError,
 )
@@ -55,6 +58,17 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 _ResponseT = TypeVar("_ResponseT")
+
+
+def _deadline_context(deadline: float | None) -> AbstractAsyncContextManager[Any]:
+    """Return an async context manager that times out at *deadline*.
+
+    The deadline is on the monotonic clock, the same one the event loop
+    uses. A ``None`` deadline means no timeout.
+    """
+    if deadline is None:
+        return nullcontext()
+    return asyncio.timeout_at(deadline)
 
 
 class _BaseResponseArgs(TypedDict):
@@ -93,7 +107,7 @@ class BaseStreamingDownloadHandler(BaseHttpDownloadHandler, Generic[_ResponseT])
 
     @abstractmethod
     def _make_request(
-        self, request: Request, timeout: float
+        self, request: Request, timeout: float | None
     ) -> AbstractAsyncContextManager[_ResponseT]:
         """Return an async context manager yielding the library-specific response.
 
@@ -167,15 +181,37 @@ class BaseStreamingDownloadHandler(BaseHttpDownloadHandler, Generic[_ResponseT])
                 f"The 'bindaddress' request meta key is not supported by"
                 f" {type(self).__name__} and will be ignored."
             )
-        timeout: float = request.meta.get(
+        timeout: float | None = request.meta.get(
             "download_timeout", self._DEFAULT_CONNECT_TIMEOUT
         )
         start_time = time.monotonic()
-        async with self._make_request(request, timeout) as response:
-            request.meta["download_latency"] = time.monotonic() - start_time
-            return await self._read_response(response, request)
+        # The timeout limits the whole response window, from the start of
+        # the request to the end of the response body, matching the
+        # semantics of the HTTP/1.1 download handler, and not a single read
+        # operation, so that responses whose bodies trickle in indefinitely
+        # are aborted as well.
+        deadline = None if timeout is None else start_time + timeout
+        try:
+            async with AsyncExitStack() as stack:
+                # Bound the connect and headers phases by the deadline here;
+                # the body phase is bounded in _read_response() itself, so
+                # that hitting the deadline there goes through
+                # _handle_body_exception() and can result in a partial
+                # response.
+                async with _deadline_context(deadline):
+                    response = await stack.enter_async_context(
+                        self._make_request(request, timeout)
+                    )
+                request.meta["download_latency"] = time.monotonic() - start_time
+                return await self._read_response(response, request, deadline)
+        except TimeoutError as e:
+            raise DownloadTimeoutError(
+                f"Getting {request.url} took longer than {timeout} seconds."
+            ) from e
 
-    async def _read_response(self, response: _ResponseT, request: Request) -> Response:
+    async def _read_response(
+        self, response: _ResponseT, request: Request, deadline: float | None
+    ) -> Response:
         maxsize: int = request.meta.get("download_maxsize", self._default_maxsize)
         warnsize = get_warnsize(request.meta, self._default_warnsize)
 
@@ -215,32 +251,40 @@ class BaseStreamingDownloadHandler(BaseHttpDownloadHandler, Generic[_ResponseT])
 
             bytes_received = 0
             try:
-                async for chunk in self._iter_body_chunks(response):
-                    response_body.write(chunk)
-                    bytes_received += len(chunk)
+                # Enforce the deadline here, and not only in download_request(),
+                # so that hitting it while reading the body goes through
+                # _handle_body_exception() and can result in a partial response.
+                async with _deadline_context(deadline):
+                    async for chunk in self._iter_body_chunks(response):
+                        response_body.write(chunk)
+                        bytes_received += len(chunk)
 
-                    if stop_download := check_stop_download(
-                        signals.bytes_received, self.crawler, request, data=chunk
-                    ):
-                        return make_response(
-                            **make_response_base_args,
-                            body=self._get_body(response_body, response, request),
-                            stop_download=stop_download,
-                        )
-
-                    if maxsize and bytes_received > maxsize:
-                        response_body.truncate(0)
-                        self._cancel_maxsize(
-                            bytes_received, maxsize, request, expected=False
-                        )
-
-                    if warnsize and bytes_received > warnsize and not reached_warnsize:
-                        reached_warnsize = True
-                        logger.warning(
-                            get_warnsize_msg(
-                                bytes_received, warnsize, request, expected=False
+                        if stop_download := check_stop_download(
+                            signals.bytes_received, self.crawler, request, data=chunk
+                        ):
+                            return make_response(
+                                **make_response_base_args,
+                                body=self._get_body(response_body, response, request),
+                                stop_download=stop_download,
                             )
-                        )
+
+                        if maxsize and bytes_received > maxsize:
+                            response_body.truncate(0)
+                            self._cancel_maxsize(
+                                bytes_received, maxsize, request, expected=False
+                            )
+
+                        if (
+                            warnsize
+                            and bytes_received > warnsize
+                            and not reached_warnsize
+                        ):
+                            reached_warnsize = True
+                            logger.warning(
+                                get_warnsize_msg(
+                                    bytes_received, warnsize, request, expected=False
+                                )
+                            )
             except Exception as e:
                 return self._handle_body_exception(
                     e,

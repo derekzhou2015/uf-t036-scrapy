@@ -7,6 +7,7 @@ import os
 import re
 import socket
 import sys
+import time
 from abc import ABC, abstractmethod
 from contextlib import asynccontextmanager
 from http import HTTPStatus
@@ -637,6 +638,44 @@ class TestHttpBase(ABC):
         assert response.status == 200
         assert response.body == b"some bytes"
         assert response.flags == ["dataloss"]
+
+    @coroutine_test
+    async def test_timeout_download_from_spider_server_slow_drip(
+        self, mockserver: MockServer
+    ) -> None:
+        # client connects, the server sends the headers right away but then
+        # drips the body one byte at a time, so no single read stalls while
+        # the overall response window is exceeded
+        meta = {"download_timeout": 0.5}
+        request = Request(
+            mockserver.url("/slow-drip", is_secure=self.is_secure), meta=meta
+        )
+        async with self.get_dh() as download_handler:
+            start_time = time.monotonic()
+            with pytest.raises(DownloadTimeoutError):
+                await download_handler.download_request(request)
+        # the full drip takes seconds to complete; the download must be
+        # aborted by the configured timeout instead
+        assert time.monotonic() - start_time < 5
+
+    @coroutine_test
+    async def test_timeout_download_from_spider_server_slow_drip_partial_response(
+        self, mockserver: MockServer
+    ) -> None:
+        if not self.handler_supports_partial_response_on_timeout:
+            pytest.skip("This handler doesn't support partial responses on timeout")
+        # like above, but with dataloss failures disabled the body received
+        # so far is returned instead of raising a timeout error
+        meta = {"download_timeout": 0.5, "download_fail_on_dataloss": False}
+        request = Request(
+            mockserver.url("/slow-drip", is_secure=self.is_secure), meta=meta
+        )
+        async with self.get_dh() as download_handler:
+            response = await download_handler.download_request(request)
+        assert response.status == 200
+        assert response.flags == ["dataloss"]
+        assert response.body
+        assert set(response.body) == {ord("x")}
 
     @pytest.mark.parametrize("send_header", [True, False])
     @coroutine_test

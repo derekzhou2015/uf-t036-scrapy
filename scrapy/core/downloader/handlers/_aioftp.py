@@ -114,7 +114,7 @@ class AioftpDownloadHandler(BaseStreamingDownloadHandler[_AioftpResponse]):
     async def _make_request(
         self,
         request: Request,
-        timeout: float,  # noqa: ASYNC109
+        timeout: float | None,  # noqa: ASYNC109
     ) -> AsyncGenerator[_AioftpResponse]:
         url = urlparse_cached(request)
         assert url.hostname
@@ -218,9 +218,9 @@ class AioftpDownloadHandler(BaseStreamingDownloadHandler[_AioftpResponse]):
         return super()._get_body(buffer, response, request)
 
     async def _read_response(
-        self, response: _AioftpResponse, request: Request
+        self, response: _AioftpResponse, request: Request, deadline: float | None
     ) -> Response:
-        result = await super()._read_response(response, request)
+        result = await super()._read_response(response, request, deadline)
         if response.data is not None:
             self._add_ftp_headers(result, response, request)
         return result
